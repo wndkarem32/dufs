@@ -41,6 +41,8 @@ use tokio::{fs, io};
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
+use md5;
+use fs4::{free_space, total_space};
 
 pub type Request = hyper::Request<Body>;
 pub type Response = hyper::Response<Body>;
@@ -129,7 +131,7 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(self: Arc<Self>, mut req: Request) -> Result<Response> {
         let mut res = Response::default();
 
         let req_path = req.uri().path();
@@ -338,6 +340,15 @@ impl Server {
                     status_not_found(&mut res);
                 }
             }
+            Method::PATCH => {
+                if !allow_upload || (!allow_delete && is_file && size > 0) {
+                    status_forbid(&mut res);
+                } else if !is_miss {
+                    self.handle_partial_upload(path, &mut req, &mut res).await?;
+                } else {
+                    status_not_found(&mut res);
+                }
+			}
             method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
@@ -437,6 +448,94 @@ impl Server {
         *res.status_mut() = StatusCode::CREATED;
         Ok(())
     }
+    async fn handle_partial_upload(&self, path: &Path,
+									req: &mut Request,
+									res: &mut Response) -> Result<()> {
+		ensure_path_parent(path).await?;
+		let headers = req.headers();
+		let offset : u64;
+		let partsize : u64;
+		let mut file : tokio::fs::File;
+		let mut append = false;
+		let a = HeaderValue::from_static("");
+		let sabredav_content_type = headers.get(CONTENT_TYPE).unwrap_or_else( || &a );
+		if sabredav_content_type != HeaderValue::from_static("application/x-sabredav-partialupdate") {
+			status_unrecognized_content_type(res);
+			return Ok(());
+		}
+		let sizeopt = headers.get(CONTENT_LENGTH);
+		if sizeopt.is_none() {
+			status_length_required(res);
+			return Ok(());		
+		}
+		let size = sizeopt.unwrap().to_str()?.parse::<u64>()?;
+		let rangeopt = parse_update_range(headers);
+		if rangeopt.is_none() {
+			status_bad_request(res);
+			return Ok(());
+		}
+		let range = rangeopt.unwrap();
+		if range.append {
+			append = true;
+		}
+		let read_backward = range.start.is_none() && range.end.is_some();
+		let without_end = range.start.is_some() && range.end.is_none();
+		let start = range.start.unwrap_or(0);
+		let end = range.end.unwrap_or(0);
+		
+		let file_res =  if append {
+			fs::OpenOptions::new().write(true).append(true).open(&path).await
+			}
+			else {
+			fs::OpenOptions::new().write(true).open(&path).await
+			};
+		if file_res.is_err() {
+			status_not_found(res);
+			return Ok(());
+		}
+		file = file_res.ok().unwrap();
+        let filesize = file.metadata().await?.len();
+
+        if read_backward {
+			offset = if filesize > end {filesize-end} else {0};
+			partsize = if end < size {end} else {size};
+		}
+		else if without_end {
+			offset = start;
+			partsize = size;
+		}
+		else if start < end && end-start == size {
+			offset = start;
+			partsize = end-start;
+		}
+		else {
+			offset = 0;
+			partsize = 0;
+		}
+        if partsize > 0 || append {
+			if filesize < offset+partsize {
+				file.set_len(offset+partsize).await?;
+			}
+			if append == false {
+				file.seek(SeekFrom::Start(offset)).await?;
+			}
+			let body_with_io_error = req
+				.body_mut()
+				.map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+			let body_reader = StreamReader::new(body_with_io_error);
+			futures::pin_mut!(body_reader);	
+			io::copy(&mut body_reader, &mut file).await?;
+			*res.status_mut() = StatusCode::OK;
+		}
+		else {
+                *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                res.headers_mut()
+                    .insert("X-Update-Range", format!("bytes {}-{}/{}", offset, offset+partsize, filesize).parse()?);
+		}
+        Ok(())
+    }
+    
+    
 
     async fn handle_delete(&self, path: &Path, is_dir: bool, res: &mut Response) -> Result<()> {
         match is_dir {
@@ -711,32 +810,52 @@ impl Server {
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
         let size = meta.len();
-
-        if let Some(range) = range {
-            if range
-                .end
-                .map_or_else(|| range.start < size, |v| v >= range.start)
-                && file.seek(SeekFrom::Start(range.start)).await.is_ok()
-            {
-                let end = range.end.unwrap_or(size - 1).min(size - 1);
-                let part_size = end - range.start + 1;
-                let reader = Streamer::new(file, BUF_SIZE);
+        let offset : u64;
+        let partsize : u64;
+		if range.is_some() {
+			let range_buf = range.unwrap();
+			let read_backward = range_buf.start.is_none() && range_buf.end.is_some();
+			let without_end = range_buf.start.is_some() && range_buf.end.is_none();
+			let start = range_buf.start.unwrap_or(0);
+			let end = range_buf.end.unwrap_or(0);
+			if read_backward {
+				offset = if size > end {size-end-1} else {0};
+				partsize = if size > end { end+1} else {0};
+			}
+			else if without_end {
+				offset = start;
+				partsize = if start <= size {size-start} else {0};	
+			}
+			else {
+				if start < size && end < size && start <= end {
+				offset = start;
+				partsize = end+1;
+				}
+				else {
+				offset = 0;
+				partsize = 0;
+				}
+			}
+			if partsize > 0 && file.seek(SeekFrom::Start(offset)).await.is_ok() {
+			    let reader = Streamer::new(file, BUF_SIZE);
                 *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-                let content_range = format!("bytes {}-{}/{}", range.start, end, size);
+                let content_range = format!("bytes {}-{}/{}", offset, offset+partsize-1, size);
                 res.headers_mut()
                     .insert(CONTENT_RANGE, content_range.parse()?);
                 res.headers_mut()
-                    .insert(CONTENT_LENGTH, format!("{part_size}").parse()?);
+                    .insert(CONTENT_LENGTH, format!("{partsize}").parse()?);
                 if head_only {
                     return Ok(());
                 }
-                *res.body_mut() = Body::wrap_stream(reader.into_stream_sized(part_size));
-            } else {
+                *res.body_mut() = Body::wrap_stream(reader.into_stream_sized(partsize));
+			}
+			else {
                 *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
                 res.headers_mut()
                     .insert(CONTENT_RANGE, format!("bytes */{size}").parse()?);
-            }
-        } else {
+			}
+		}
+        else {
             res.headers_mut()
                 .insert(CONTENT_LENGTH, format!("{size}").parse()?);
             if head_only {
@@ -1230,6 +1349,22 @@ impl PathItem {
         if self.is_dir() && !href.ends_with('/') {
             href.push('/');
         }
+        let totalspace = total_space("/").unwrap_or(0);
+        let freespace = free_space("/").unwrap_or(0);
+        
+        let diskquota = if href == "/" && totalspace > freespace {
+				let usedbytes = totalspace - freespace;
+				format!(r#"<D:propstat>
+<D:prop>
+<D:quota-used-bytes>{usedbytes}</D:quota-used-bytes>
+<D:quota-available-bytes>{freespace}</D:quota-available-bytes>
+</D:prop>
+<D:status>HTTP/1.1 200 OK</D:status>"#)
+			}
+			else {
+				String::new()
+			};
+		
         let displayname = escape_str_pcdata(self.base_name());
         match self.path_type {
             PathType::Dir | PathType::SymlinkDir => format!(
@@ -1243,6 +1378,7 @@ impl PathItem {
 </D:prop>
 <D:status>HTTP/1.1 200 OK</D:status>
 </D:propstat>
+{diskquota}
 </D:response>"#
             ),
             PathType::File | PathType::SymlinkFile => format!(
@@ -1427,14 +1563,15 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     let mtime = meta.modified().ok()?;
     let timestamp = to_timestamp(&mtime);
     let size = meta.len();
-    let etag = format!(r#""{timestamp}-{size}""#).parse::<ETag>().ok()?;
+    let md5buf = md5::compute(format!("{timestamp}-{size}"));
+    let etag = format!(r#""{:x}""#, md5buf).parse::<ETag>().ok()?;
     let last_modified = LastModified::from(mtime);
     Some((etag, last_modified))
 }
 
 #[derive(Debug)]
 struct RangeValue {
-    start: u64,
+    start: Option<u64>,
     end: Option<u64>,
 }
 
@@ -1443,22 +1580,40 @@ fn parse_range(headers: &HeaderMap<HeaderValue>) -> Option<RangeValue> {
     let hdr = range_hdr.to_str().ok()?;
     let mut sp = hdr.splitn(2, '=');
     let units = sp.next()?;
-    if units == "bytes" {
-        let range = sp.next()?;
-        let mut sp_range = range.splitn(2, '-');
-        let start: u64 = sp_range.next()?.parse().ok()?;
-        let end: Option<u64> = if let Some(end) = sp_range.next() {
-            if end.is_empty() {
-                None
-            } else {
-                Some(end.parse().ok()?)
-            }
-        } else {
-            None
-        };
-        Some(RangeValue { start, end })
-    } else {
-        None
+	if units == "bytes" {
+		let mut sp_range = sp.next()?.splitn(2, '-');
+		let start = sp_range.next()?.parse().ok();
+		let end = sp_range.next()?.parse().ok();
+		Some(RangeValue { start: start, end: end })
+	}
+    else {
+		None
+    }
+}
+
+#[derive(Debug)]
+struct XUpdateRange {
+	append : bool,
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+fn parse_update_range(headers: &HeaderMap<HeaderValue>) -> Option<XUpdateRange> {
+    let range_hdr = headers.get("X-Update-Range")?;
+    let hdr = range_hdr.to_str().ok()?;
+    if hdr == "append" {
+		return Some(XUpdateRange{ append: true, start: None, end: None});
+	}
+    let mut sp = hdr.splitn(2, '=');
+    let units = sp.next()?;
+	if units == "bytes" {
+		let mut sp_range = sp.next()?.splitn(2, '-');
+		let start = sp_range.next()?.parse().ok();
+		let end = sp_range.next()?.parse().ok();
+		Some(XUpdateRange { append: false, start: start, end: end})
+	}
+    else {
+		None
     }
 }
 
@@ -1474,6 +1629,21 @@ fn status_not_found(res: &mut Response) {
 
 fn status_no_content(res: &mut Response) {
     *res.status_mut() = StatusCode::NO_CONTENT;
+}
+
+fn status_unrecognized_content_type(res: &mut Response) {
+	*res.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+	*res.body_mut() = Body::from("Not Recognized");
+}
+
+fn status_length_required(res: &mut Response) {
+	*res.status_mut() = StatusCode::LENGTH_REQUIRED;
+	*res.body_mut() = Body::from("Content-Length header not provided");
+}
+
+fn status_bad_request(res: &mut Response) {
+	*res.status_mut() = StatusCode::BAD_REQUEST;
+	*res.body_mut() = Body::from("Bad Request");
 }
 
 fn set_content_diposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
@@ -1505,10 +1675,10 @@ fn is_hidden(hidden: &[String], file_name: &str, is_dir_type: bool) -> bool {
 fn set_webdav_headers(res: &mut Response) {
     res.headers_mut().insert(
         "Allow",
-        HeaderValue::from_static("GET,HEAD,PUT,OPTIONS,DELETE,PROPFIND,COPY,MOVE"),
+        HeaderValue::from_static("GET,HEAD,PUT,OPTIONS,DELETE,PROPFIND,PROPPATCH,COPY,MOVE,PATCH"),
     );
     res.headers_mut()
-        .insert("DAV", HeaderValue::from_static("1,2"));
+        .insert("DAV", HeaderValue::from_static("1,2,sabredav-partialupdate"));
 }
 
 async fn get_content_type(path: &Path) -> Result<String> {
